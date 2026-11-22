@@ -14,14 +14,28 @@ function jsonResponse(payload, status = 200) {
   });
 }
 
+async function fetchWithTimeout(url, options = {}, timeoutMs = 9500) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function normalizeInstagramUrl(rawUrl) {
   try {
     const parsed = new URL(rawUrl.trim());
-    const hostname = parsed.hostname.replace(/^www\./, "");
-    const isInstagramHost =
-      hostname === "instagram.com" || hostname.endsWith(".instagram.com");
+    const hostname = parsed.hostname.replace(/^www\./, "").toLowerCase();
 
-    if (!isInstagramHost) return null;
+    if (hostname !== "instagram.com" && !hostname.endsWith(".instagram.com")) {
+      return null;
+    }
 
     const match = parsed.pathname.match(/^\/(p|reel|reels|tv)\/([A-Za-z0-9_-]+)/);
     if (!match) return null;
@@ -45,15 +59,24 @@ function decodeHtmlEntities(str) {
   return str
     .replace(/&amp;/g, "&")
     .replace(/&quot;/g, '"')
-    .replace(/&#x27;/g, "'")
-    .replace(/&#39;/g, "'")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
+    .replace(/&apos;/g, "'")
     .replace(/\\u0026/g, "&")
-    .replace(/\\\//g, "/");
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) =>
+      String.fromCharCode(parseInt(hex, 16))
+    )
+    .replace(/\\\//g, "/")
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) =>
+      String.fromCodePoint(parseInt(hex, 16))
+    )
+    .replace(/&#([0-9]+);/g, (_, dec) =>
+      String.fromCodePoint(parseInt(dec, 10))
+    );
 }
 
 function extractMetaContent(html, propertyName) {
+  if (!html) return null;
   const patterns = [
     new RegExp(`<meta[^>]+property=["']${propertyName}["'][^>]+content=["']([^"']+)["']`, "i"),
     new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+property=["']${propertyName}["']`, "i"),
@@ -62,26 +85,73 @@ function extractMetaContent(html, propertyName) {
 
   for (const regex of patterns) {
     const match = html.match(regex);
-    if (match && match[1]) {
+    if (match?.[1]) {
       return decodeHtmlEntities(match[1]);
     }
   }
   return null;
 }
 
+function isLikelyVideoUrl(candidate) {
+  if (!candidate || typeof candidate !== "string") return false;
+  const clean = decodeHtmlEntities(candidate).trim();
+  if (!clean.startsWith("https://") && !clean.startsWith("http://")) return false;
+  if (clean.includes("rsrc.php") || clean.includes(".js") || clean.includes(".css")) {
+    return false;
+  }
+
+  return (
+    /\.mp4(\?|&|$)/i.test(clean) ||
+    /video_mp4/i.test(clean) ||
+    /\/o1\/v\//i.test(clean) ||
+    /\/v\/t\d+\./i.test(clean) ||
+    /cdninstagram\.com|fbcdn\.net/i.test(clean)
+  );
+}
+
+function extractVideoUrl(text) {
+  if (!text) return null;
+
+  const patterns = [
+    /"video_url"\s*:\s*"([^"]+)"/gi,
+    /"playback_url"\s*:\s*"([^"]+)"/gi,
+    /"browser_native_hd_url"\s*:\s*"([^"]+)"/gi,
+    /"browser_native_sd_url"\s*:\s*"([^"]+)"/gi,
+    /"src"\s*:\s*"(https?:(?:\\\/|\/)[^"]*?\.mp4[^"]*)"/gi,
+    /<meta[^>]+property=["']og:video(?::secure_url)?["'][^>]+content=["']([^"']+)["']/gi,
+    /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:video(?::secure_url)?["']/gi,
+    /<video[^>]+src=["']([^"']+)["']/gi,
+    /(https?:\\\/\\\/[^"'\s<>]+?\.mp4(?:\\u0026[^"'\s<>]*|[?&][^"'\s<>]*)?)/gi,
+    /(https?:\/\/[^"'\s<>]+?\.mp4(?:[?&][^"'\s<>]*)?)/gi
+  ];
+
+  for (const regex of patterns) {
+    let match;
+    while ((match = regex.exec(text)) !== null) {
+      const candidate = match[1];
+      if (isLikelyVideoUrl(candidate)) {
+        return decodeHtmlEntities(candidate).trim();
+      }
+    }
+  }
+
+  return null;
+}
+
 async function fetchHtml(url) {
-  const response = await fetch(url, {
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "en-US,en;q=0.9",
-      "Sec-Fetch-Site": "none",
-      "Sec-Fetch-Mode": "navigate"
+  const response = await fetchWithTimeout(
+    url,
+    {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      redirect: "follow"
     },
-    redirect: "follow",
-    signal: AbortSignal.timeout(9000)
-  });
+    9500
+  );
 
   if (!response.ok) {
     throw new Error(`Upstream HTTP ${response.status}`);
@@ -90,8 +160,7 @@ async function fetchHtml(url) {
   return await response.text();
 }
 
-async function extractInstagramMedia(normalized, env) {
-  // Optional external provider fallback if configured via Cloudflare Secrets
+async function extractInstagramVideo(normalized, env) {
   if (env?.UPSTREAM_API_URL) {
     const upstream = new URL(env.UPSTREAM_API_URL);
     upstream.searchParams.set("url", normalized.cleanUrl);
@@ -101,93 +170,79 @@ async function extractInstagramMedia(normalized, env) {
       headers["Authorization"] = `Bearer ${env.UPSTREAM_API_KEY}`;
     }
 
-    const res = await fetch(upstream.toString(), {
-      headers,
-      signal: AbortSignal.timeout(9000)
-    });
-
+    const res = await fetchWithTimeout(upstream.toString(), { headers }, 9500);
     if (res.ok) {
       const json = await res.json();
-      if (json?.items?.length) return json;
+      const videoItem = json?.items?.find(
+        (item) => item.type === "video" && isLikelyVideoUrl(item.url)
+      );
+      if (videoItem) {
+        return {
+          shortcode: normalized.shortcode,
+          kind: normalized.kind,
+          title: decodeHtmlEntities(
+            json.title || `Instagram ${normalized.kind} (${normalized.shortcode})`
+          ),
+          items: [
+            {
+              type: "video",
+              quality: videoItem.quality || "HD",
+              url: decodeHtmlEntities(videoItem.url).trim(),
+              thumbnail: videoItem.thumbnail ? decodeHtmlEntities(videoItem.thumbnail) : null,
+              filename: `ig_${normalized.shortcode}.mp4`
+            }
+          ]
+        };
+      }
     }
   }
 
-  // Primary strategy: Inspect public post/embed HTML metadata
   let html = "";
+  let embedHtml = "";
+
   try {
     html = await fetchHtml(normalized.cleanUrl);
   } catch {
-    html = await fetchHtml(normalized.embedUrl);
+    html = "";
   }
 
-  let videoUrl =
-    extractMetaContent(html, "og:video:secure_url") ||
-    extractMetaContent(html, "og:video");
-
-  let imageUrl =
+  let videoUrl = extractVideoUrl(html);
+  const thumbnail =
     extractMetaContent(html, "og:image:secure_url") ||
-    extractMetaContent(html, "og:image");
+    extractMetaContent(html, "og:image") ||
+    null;
 
-  const title =
-    extractMetaContent(html, "og:title") ||
-    `Instagram ${normalized.kind} (${normalized.shortcode})`;
-
-  // Secondary regex scan inside embedded JSON payloads
   if (!videoUrl) {
-    const videoMatch = html.match(/"video_url"\s*:\s*"([^"]+)"/);
-    if (videoMatch?.[1]) {
-      videoUrl = decodeHtmlEntities(videoMatch[1]);
+    try {
+      embedHtml = await fetchHtml(normalized.embedUrl);
+      videoUrl = extractVideoUrl(embedHtml);
+    } catch {
+      embedHtml = "";
     }
   }
 
-  if (!imageUrl) {
-    const imgMatch = html.match(/"display_url"\s*:\s*"([^"]+)"/);
-    if (imgMatch?.[1]) {
-      imageUrl = decodeHtmlEntities(imgMatch[1]);
-    }
+  if (!videoUrl) {
+    throw new Error("NO_VIDEO_FOUND");
   }
 
-  // Fallback to embed endpoint if main page returned login wall without OG tags
-  if (!videoUrl && !imageUrl) {
-    const embedHtml = await fetchHtml(normalized.embedUrl);
-    const embedVideo = embedHtml.match(/"video_url"\s*:\s*"([^"]+)"/);
-    const embedImg =
-      embedHtml.match(/class="EmbeddedMediaImage"[^>]+src="([^"]+)"/) ||
-      embedHtml.match(/"display_url"\s*:\s*"([^"]+)"/);
-
-    if (embedVideo?.[1]) videoUrl = decodeHtmlEntities(embedVideo[1]);
-    if (embedImg?.[1]) imageUrl = decodeHtmlEntities(embedImg[1]);
-  }
-
-  const items = [];
-
-  if (videoUrl) {
-    items.push({
-      type: "video",
-      quality: "HD",
-      url: videoUrl,
-      thumbnail: imageUrl || null,
-      filename: `ig_${normalized.shortcode}.mp4`
-    });
-  } else if (imageUrl) {
-    items.push({
-      type: "image",
-      quality: "HD",
-      url: imageUrl,
-      thumbnail: imageUrl,
-      filename: `ig_${normalized.shortcode}.jpg`
-    });
-  }
-
-  if (items.length === 0) {
-    throw new Error("NO_MEDIA_FOUND");
-  }
+  const rawTitle =
+    extractMetaContent(html, "og:title") ||
+    extractMetaContent(embedHtml, "og:title") ||
+    `Instagram ${normalized.kind} (${normalized.shortcode})`;
 
   return {
     shortcode: normalized.shortcode,
     kind: normalized.kind,
-    title,
-    items
+    title: decodeHtmlEntities(rawTitle),
+    items: [
+      {
+        type: "video",
+        quality: "HD",
+        url: videoUrl,
+        thumbnail,
+        filename: `ig_${normalized.shortcode}.mp4`
+      }
+    ]
   };
 }
 
@@ -220,11 +275,11 @@ export default {
       return jsonResponse({
         success: true,
         service: "ig-media-api",
-        status: "healthy"
+        status: "healthy",
+        mode: "video-only"
       });
     }
 
-    // 1. Metadata & Direct Media Link Endpoint
     if (url.pathname === "/api/media") {
       const rawUrl = url.searchParams.get("url");
       const normalized = rawUrl ? normalizeInstagramUrl(rawUrl) : null;
@@ -240,30 +295,29 @@ export default {
       }
 
       try {
-        const data = await extractInstagramMedia(normalized, env);
+        const data = await extractInstagramVideo(normalized, env);
         return jsonResponse({
           success: true,
           source: normalized.cleanUrl,
           data
         });
       } catch (err) {
-        const isPrivateOrBlocked = err.message === "NO_MEDIA_FOUND";
+        const noVideo = err.message === "NO_VIDEO_FOUND";
         return jsonResponse(
           {
             success: false,
-            error: isPrivateOrBlocked
-              ? "Could not extract media. The post may be private or temporarily rate-limited."
-              : "Failed to fetch media metadata."
+            error: noVideo
+              ? "No direct video stream found for this Instagram link. Instagram may restrict public video URLs on this post."
+              : "Failed to fetch Instagram video metadata."
           },
-          isPrivateOrBlocked ? 422 : 502
+          noVideo ? 422 : 502
         );
       }
     }
 
-    // 2. Direct Download Proxy (Forces browser file download)
     if (url.pathname === "/api/download") {
       const mediaUrl = url.searchParams.get("mediaUrl");
-      const filename = (url.searchParams.get("filename") || "instagram-media.mp4").replace(
+      const filename = (url.searchParams.get("filename") || "instagram-video.mp4").replace(
         /[^a-zA-Z0-9._-]/g,
         "_"
       );
@@ -276,23 +330,26 @@ export default {
       }
 
       try {
-        const upstream = await fetch(mediaUrl, {
-          headers: {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
-            "Referer": "https://www.instagram.com/"
+        const upstream = await fetchWithTimeout(
+          mediaUrl,
+          {
+            headers: {
+              "User-Agent":
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+              "Referer": "https://www.instagram.com/"
+            }
           },
-          signal: AbortSignal.timeout(15000)
-        });
+          15000
+        );
 
         if (!upstream.ok) {
-          return jsonResponse({ success: false, error: "Upstream media fetch failed." }, 502);
+          return jsonResponse({ success: false, error: "Upstream video fetch failed." }, 502);
         }
 
         const headers = new Headers(CORS_HEADERS);
         headers.set(
           "Content-Type",
-          upstream.headers.get("Content-Type") || "application/octet-stream"
+          upstream.headers.get("Content-Type") || "video/mp4"
         );
         headers.set("Content-Disposition", `attachment; filename="${filename}"`);
 
@@ -301,7 +358,7 @@ export default {
           headers
         });
       } catch {
-        return jsonResponse({ success: false, error: "Download stream timed out." }, 504);
+        return jsonResponse({ success: false, error: "Video download stream timed out." }, 504);
       }
     }
 
